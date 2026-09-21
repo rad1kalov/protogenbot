@@ -1,12 +1,11 @@
 import os
-import sqlite3
 from datetime import datetime, timezone
-from pathlib import Path
 
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import (
 	Application,
+	BusinessConnectionHandler,
 	BusinessMessagesDeletedHandler,
 	ContextTypes,
 	MessageHandler,
@@ -16,27 +15,17 @@ from telegram.ext import (
 
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_PATH = Path(__file__).with_name("messages.db")
+
+business_accounts: dict[str, int] = {}
+message_cache: dict[tuple[str, int, int], str] = {}
 
 
-def initialize_database() -> None:
-	with sqlite3.connect(DATABASE_PATH) as connection:
-		connection.execute(
-			"""
-			CREATE TABLE IF NOT EXISTS business_messages (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				business_connection_id TEXT NOT NULL,
-				chat_id INTEGER NOT NULL,
-				message_id INTEGER NOT NULL,
-				user_id INTEGER,
-				username TEXT,
-				created_at TEXT NOT NULL,
-				text TEXT,
-				content_type TEXT NOT NULL,
-				deleted_at TEXT
-			)
-			"""
-		)
+async def on_business_connection(
+	update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+	connection = update.business_connection
+	if connection:
+		business_accounts[connection.id] = connection.user_chat_id
 
 
 async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -45,8 +34,8 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 	if not message or not chat or not message.business_connection_id:
 		return
 
-	content_type = "text"
 	text = message.text or message.caption
+	content_type = "text"
 	if message.photo:
 		content_type = "photo"
 	elif message.video:
@@ -65,25 +54,15 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 		content_type = "contact"
 
 	user = message.from_user
-	with sqlite3.connect(DATABASE_PATH) as connection:
-		connection.execute(
-			"""
-			INSERT INTO business_messages
-			(business_connection_id, chat_id, message_id, user_id, username,
-			 created_at, text, content_type)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-			""",
-			(
-				message.business_connection_id,
-				chat.id,
-				message.message_id,
-				user.id if user else None,
-				user.username if user else None,
-				datetime.now(timezone.utc).isoformat(),
-				text,
-				content_type,
-			),
-		)
+	sender = f"@{user.username}" if user and user.username else "без username"
+	message_text = text or f"[{content_type}]"
+	message_cache[
+		(message.business_connection_id, chat.id, message.message_id)
+	] = (
+		f"{message_text}\n"
+		f"Отправитель: {sender}\n"
+		f"Время: {datetime.now(timezone.utc).isoformat()}"
+	)
 
 	if text and text.split(maxsplit=1)[0].split("@", maxsplit=1)[0] == "/start":
 		await context.bot.send_message(
@@ -100,31 +79,26 @@ async def on_business_messages_deleted(
 	if not deleted:
 		return
 
-	with sqlite3.connect(DATABASE_PATH) as connection:
-		connection.executemany(
-			"""
-			UPDATE business_messages
-			SET deleted_at = ?
-			WHERE business_connection_id = ? AND chat_id = ? AND message_id = ?
-			""",
-			(
-				(
-					datetime.now(timezone.utc).isoformat(),
-					deleted.business_connection_id,
-					deleted.chat.id,
-					message_id,
-				)
-				for message_id in deleted.message_ids
-			),
-		)
+	account_id = business_accounts.get(deleted.business_connection_id)
+	if not account_id:
+		return
+
+	for message_id in deleted.message_ids:
+		key = (deleted.business_connection_id, deleted.chat.id, message_id)
+		archived_message = message_cache.pop(key, None)
+		if archived_message:
+			await context.bot.send_message(
+				chat_id=account_id,
+				text=f"Удалено сообщение:\n\n{archived_message}",
+			)
 
 
 def main() -> None:
 	if not TOKEN:
 		raise RuntimeError("Укажите BOT_TOKEN в файле .env")
 
-	initialize_database()
 	application = Application.builder().token(TOKEN).build()
+	application.add_handler(BusinessConnectionHandler(on_business_connection))
 	application.add_handler(
 		MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, on_business_message)
 	)
