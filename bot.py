@@ -24,6 +24,7 @@ logger = logging.getLogger("protogenbot")
 
 business_accounts: dict[str, int] = {}
 message_cache: dict[tuple[str, int, int], str] = {}
+greeted_business_chats: set[tuple[str, int]] = set()
 
 INSTRUCTION_TEXT = (
 	"Инструкция по подключению:\n\n"
@@ -31,7 +32,7 @@ INSTRUCTION_TEXT = (
 	"2. Откройте Telegram Business.\n"
 	"3. Выберите Чат-боты и добавьте этого бота.\n"
 	"4. Разрешите боту доступ к сообщениям.\n"
-	"5. После подключения отправьте /start в нужном бизнес-чате.\n\n"
+	"5. После подключения просто напишите любое сообщение в нужном бизнес-чате.\n\n"
 	"После этого бот будет присылать удалённые сообщения в личный чат владельца аккаунта."
 )
 
@@ -75,7 +76,10 @@ async def on_business_connection(
 ) -> None:
 	connection = update.business_connection
 	if connection:
-		business_accounts[connection.id] = connection.user_chat_id
+		if connection.is_enabled:
+			business_accounts[connection.id] = connection.user_chat_id
+		else:
+			business_accounts.pop(connection.id, None)
 		logger.info(
 			"Business connection %s: user_chat_id=%s enabled=%s",
 			connection.id,
@@ -128,11 +132,17 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 		f"Время: {datetime.now(timezone.utc).isoformat()}"
 	)
 
-	if text and text.split(maxsplit=1)[0].split("@", maxsplit=1)[0] == "/start":
+	is_start = bool(
+		text and text.split(maxsplit=1)[0].split("@", maxsplit=1)[0] == "/start"
+	)
+	chat_key = (message.business_connection_id, chat.id)
+	if is_start or chat_key not in greeted_business_chats:
+		greeted_business_chats.add(chat_key)
 		logger.info(
-			"Sending start response: connection=%s chat=%s",
+			"Sending greeting: connection=%s chat=%s start_command=%s",
 			message.business_connection_id,
 			chat.id,
+			is_start,
 		)
 		await context.bot.send_message(
 			chat_id=chat.id,
@@ -194,6 +204,18 @@ async def on_business_messages_deleted(
 	for message_id in deleted.message_ids:
 		key = (deleted.business_connection_id, deleted.chat.id, message_id)
 		archived_message = message_cache.pop(key, None)
+		if archived_message is None:
+			matching_key = next(
+				(
+					cache_key
+					for cache_key in message_cache
+					if cache_key[0] == deleted.business_connection_id
+					and cache_key[2] == message_id
+				),
+				None,
+			)
+			if matching_key:
+				archived_message = message_cache.pop(matching_key)
 		if archived_message:
 			logger.info(
 				"Forwarding deleted message: connection=%s chat=%s message=%s account=%s",
@@ -230,7 +252,7 @@ def main() -> None:
 	)
 	application.add_handler(CallbackQueryHandler(on_instruction, pattern="^instruction$"))
 	application.add_handler(BusinessMessagesDeletedHandler(on_business_messages_deleted))
-	application.run_polling()
+	application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
