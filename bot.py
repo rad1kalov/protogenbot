@@ -1,7 +1,9 @@
-import os
 import logging
+import os
+import sqlite3
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
-from datetime import datetime, timezone
+from pathlib import Path
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -20,11 +22,11 @@ from telegram.ext import (
 
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
+DB_PATH = os.getenv("DB_PATH", "messages.db")
+MEDIA_DIR = Path(os.getenv("MEDIA_DIR", "downloads"))
 logger = logging.getLogger("protogenbot")
-
-business_accounts: dict[str, int] = {}
-message_cache: dict[tuple[str, int, int], str] = {}
-greeted_business_chats: set[tuple[str, int]] = set()
+DB: sqlite3.Connection | None = None
+greeted_chats: set[tuple[str, int]] = set()
 
 INSTRUCTION_TEXT = (
 	"Инструкция по подключению:\n\n"
@@ -32,8 +34,8 @@ INSTRUCTION_TEXT = (
 	"2. Откройте Telegram Business.\n"
 	"3. Выберите Чат-боты и добавьте этого бота.\n"
 	"4. Разрешите боту доступ к сообщениям.\n"
-	"5. После подключения просто напишите любое сообщение в нужном бизнес-чате.\n\n"
-	"После этого бот будет присылать удалённые сообщения в личный чат владельца аккаунта."
+	"5. После подключения просто напишите любое сообщение.\n\n"
+	"Удалённые сообщения и медиа будут отправляться в этот личный чат."
 )
 
 
@@ -52,8 +54,36 @@ def configure_logging() -> None:
 	logger.addHandler(console_handler)
 
 
-async def log_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-	logger.info("Update received: %s", update.to_dict())
+def init_db() -> sqlite3.Connection:
+	connection = sqlite3.connect(DB_PATH, check_same_thread=False)
+	connection.execute(
+		"""
+		CREATE TABLE IF NOT EXISTS messages (
+			message_id INTEGER NOT NULL,
+			chat_id INTEGER NOT NULL,
+			from_user_id INTEGER,
+			from_user_name TEXT,
+			text TEXT,
+			media_path TEXT,
+			media_type TEXT,
+			date TEXT NOT NULL,
+			business_connection_id TEXT NOT NULL,
+			is_ephemeral INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (message_id, chat_id)
+		)
+		"""
+	)
+	connection.execute(
+		"""
+		CREATE TABLE IF NOT EXISTS business_connections (
+			connection_id TEXT PRIMARY KEY,
+			owner_chat_id INTEGER NOT NULL,
+			enabled INTEGER NOT NULL DEFAULT 1
+		)
+		"""
+	)
+	connection.commit()
+	return connection
 
 
 def start_markup() -> InlineKeyboardMarkup:
@@ -62,9 +92,82 @@ def start_markup() -> InlineKeyboardMarkup:
 	)
 
 
+def content_type(message) -> str:
+	if message.photo:
+		return "photo"
+	if message.video:
+		return "video"
+	if message.voice:
+		return "voice"
+	if message.audio:
+		return "audio"
+	if message.document:
+		return "document"
+	if message.video_note:
+		return "video_note"
+	if message.sticker:
+		return "sticker"
+	if message.location:
+		return "location"
+	if message.contact:
+		return "contact"
+	return "text"
+
+
+async def download_media(message, context: ContextTypes.DEFAULT_TYPE):
+	attachment = message.effective_attachment
+	if not attachment:
+		return None, None
+	if isinstance(attachment, tuple):
+		attachment = attachment[-1]
+
+	try:
+		file = await context.bot.get_file(attachment.file_id)
+		extension = os.path.splitext(file.file_path or "")[1] or ".bin"
+		path = MEDIA_DIR / f"{message.chat_id}_{message.message_id}{extension}"
+		await file.download_to_drive(str(path))
+		return str(path), content_type(message)
+	except Exception:
+		logger.exception("Failed to download media for message %s", message.message_id)
+		return None, None
+
+
+async def send_media_to_owner(
+	context: ContextTypes.DEFAULT_TYPE,
+	owner_id: int,
+	media_path: str | None,
+	media_kind: str | None,
+	caption: str,
+) -> None:
+	if not media_path or not os.path.exists(media_path):
+		return
+
+	try:
+		with open(media_path, "rb") as media_file:
+			if media_kind == "photo":
+				await context.bot.send_photo(owner_id, media_file, caption=caption)
+			elif media_kind == "video":
+				await context.bot.send_video(owner_id, media_file, caption=caption)
+			elif media_kind == "voice":
+				await context.bot.send_voice(owner_id, media_file, caption=caption)
+			elif media_kind == "audio":
+				await context.bot.send_audio(owner_id, media_file, caption=caption)
+			elif media_kind == "video_note":
+				await context.bot.send_video_note(owner_id, media_file)
+				await context.bot.send_message(owner_id, caption)
+			else:
+				await context.bot.send_document(owner_id, media_file, caption=caption)
+		logger.info("Media sent to owner %s: %s", owner_id, media_path)
+	except Exception:
+		logger.exception("Failed to send media to owner %s", owner_id)
+
+
+async def log_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+	logger.info("Update received: %s", update.to_dict())
+
+
 async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 	if update.message:
-		logger.info("Start command received in regular chat: chat=%s", update.message.chat.id)
 		await update.message.reply_text(
 			"Привет! Бот работает в режиме секретаря.",
 			reply_markup=start_markup(),
@@ -75,75 +178,79 @@ async def on_business_connection(
 	update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
 	connection = update.business_connection
-	if connection:
-		if connection.is_enabled:
-			business_accounts[connection.id] = connection.user_chat_id
-		else:
-			business_accounts.pop(connection.id, None)
-		logger.info(
-			"Business connection %s: user_chat_id=%s enabled=%s",
-			connection.id,
-			connection.user_chat_id,
-			connection.is_enabled,
-		)
+	if not connection or DB is None:
+		return
+
+	DB.execute(
+		"""
+		INSERT INTO business_connections (connection_id, owner_chat_id, enabled)
+		VALUES (?, ?, ?)
+		ON CONFLICT(connection_id) DO UPDATE SET
+		owner_chat_id = excluded.owner_chat_id,
+		 enabled = excluded.enabled
+		""",
+		(connection.id, connection.user_chat_id, int(connection.is_enabled)),
+	)
+	DB.commit()
+	logger.info(
+		"Business connection updated: id=%s owner=%s enabled=%s",
+		connection.id,
+		connection.user_chat_id,
+		connection.is_enabled,
+	)
 
 
 async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+	if DB is None:
+		return
+
 	message = update.business_message
 	chat = update.effective_chat
 	if not message or not chat or not message.business_connection_id:
 		return
 
-	text = message.text or message.caption
-	content_type = "text"
-	if message.photo:
-		content_type = "photo"
-	elif message.video:
-		content_type = "video"
-	elif message.document:
-		content_type = "document"
-	elif message.audio:
-		content_type = "audio"
-	elif message.voice:
-		content_type = "voice"
-	elif message.sticker:
-		content_type = "sticker"
-	elif message.location:
-		content_type = "location"
-	elif message.contact:
-		content_type = "contact"
-
+	media_path, media_kind = await download_media(message, context)
 	user = message.from_user
-	sender = f"@{user.username}" if user and user.username else "без username"
+	from_name = user.full_name if user else "Unknown"
+	from_id = user.id if user else None
+	text = message.text or message.caption or ""
+	is_ephemeral = bool(
+		getattr(message, "ttl", None)
+		or getattr(message, "has_media_spoiler", False)
+	)
+
+	DB.execute(
+		"""
+		INSERT OR REPLACE INTO messages
+		(message_id, chat_id, from_user_id, from_user_name, text, media_path,
+		 media_type, date, business_connection_id, is_ephemeral)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		""",
+		(
+			message.message_id,
+			chat.id,
+			from_id,
+			from_name,
+			text,
+			media_path,
+			media_kind,
+			datetime.now().isoformat(timespec="seconds"),
+			message.business_connection_id,
+			int(is_ephemeral),
+		),
+	)
+	DB.commit()
 	logger.info(
-		"Business message received: connection=%s chat=%s message=%s type=%s sender=%s",
+		"Saved business message: connection=%s chat=%s message=%s media=%s",
 		message.business_connection_id,
 		chat.id,
 		message.message_id,
-		content_type,
-		sender,
-	)
-	message_text = text or f"[{content_type}]"
-	message_cache[
-		(message.business_connection_id, chat.id, message.message_id)
-	] = (
-		f"{message_text}\n"
-		f"Отправитель: {sender}\n"
-		f"Время: {datetime.now(timezone.utc).isoformat()}"
+		media_kind,
 	)
 
-	is_start = bool(
-		text and text.split(maxsplit=1)[0].split("@", maxsplit=1)[0] == "/start"
-	)
 	chat_key = (message.business_connection_id, chat.id)
-	if is_start or chat_key not in greeted_business_chats:
-		greeted_business_chats.add(chat_key)
-		logger.info(
-			"Sending greeting: connection=%s chat=%s start_command=%s",
-			message.business_connection_id,
-			chat.id,
-			is_start,
-		)
+	if chat_key not in greeted_chats or text.split(maxsplit=1)[:1] == ["/start"]:
+		greeted_chats.add(chat_key)
 		await context.bot.send_message(
 			chat_id=chat.id,
 			text="Привет! Бот работает в режиме секретаря.",
@@ -156,93 +263,75 @@ async def on_instruction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 	query = update.callback_query
 	if not query:
 		return
-
 	await query.answer()
 	message = query.message
 	if message and message.business_connection_id:
-		logger.info(
-			"Instruction requested: connection=%s chat=%s user=%s",
-			message.business_connection_id,
-			message.chat.id,
-			query.from_user.id,
-		)
 		await context.bot.send_message(
 			chat_id=message.chat.id,
 			text=INSTRUCTION_TEXT,
 			business_connection_id=message.business_connection_id,
 		)
 	else:
-		logger.info("Instruction requested in regular chat: user=%s", query.from_user.id)
-		await context.bot.send_message(
-			chat_id=query.from_user.id,
-			text=INSTRUCTION_TEXT,
-		)
+		await context.bot.send_message(query.from_user.id, INSTRUCTION_TEXT)
 
 
-async def on_business_messages_deleted(
+async def on_deleted_messages(
 	update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
+	if DB is None or not update.deleted_business_messages:
+		return
+
 	deleted = update.deleted_business_messages
-	if not deleted:
+	owner_row = DB.execute(
+		"SELECT owner_chat_id FROM business_connections WHERE connection_id = ?",
+		(deleted.business_connection_id,),
+	).fetchone()
+	if not owner_row:
+		logger.warning("Owner not found for connection %s", deleted.business_connection_id)
 		return
 
-	account_id = business_accounts.get(deleted.business_connection_id)
-	logger.info(
-		"Business messages deleted: connection=%s chat=%s message_ids=%s account_id=%s",
-		deleted.business_connection_id,
-		deleted.chat.id,
-		deleted.message_ids,
-		account_id,
-	)
-	if not account_id:
-		logger.warning(
-			"Cannot forward deleted messages: unknown business connection %s",
-			deleted.business_connection_id,
-		)
-		return
-
+	owner_id = owner_row[0]
 	for message_id in deleted.message_ids:
-		key = (deleted.business_connection_id, deleted.chat.id, message_id)
-		archived_message = message_cache.pop(key, None)
-		if archived_message is None:
-			matching_key = next(
-				(
-					cache_key
-					for cache_key in message_cache
-					if cache_key[0] == deleted.business_connection_id
-					and cache_key[2] == message_id
-				),
-				None,
-			)
-			if matching_key:
-				archived_message = message_cache.pop(matching_key)
-		if archived_message:
-			logger.info(
-				"Forwarding deleted message: connection=%s chat=%s message=%s account=%s",
-				deleted.business_connection_id,
-				deleted.chat.id,
-				message_id,
-				account_id,
-			)
-			await context.bot.send_message(
-				chat_id=account_id,
-				text=f"Удалено сообщение:\n\n{archived_message}",
-			)
-		else:
-			logger.warning(
-				"Deleted message was not found in memory: connection=%s chat=%s message=%s",
-				deleted.business_connection_id,
-				deleted.chat.id,
-				message_id,
-			)
+		row = DB.execute(
+			"""
+			SELECT from_user_id, from_user_name, text, media_path, media_type, date
+			FROM messages
+			WHERE message_id = ? AND chat_id = ? AND business_connection_id = ?
+			""",
+			(message_id, deleted.chat.id, deleted.business_connection_id),
+		).fetchone()
+		if not row:
+			logger.warning("Deleted message %s was not found in database", message_id)
+			continue
+
+		from_id, from_name, text, media_path, media_kind, date = row
+		header = (
+			"Удалено сообщение\n"
+			f"Автор: {from_name} (ID: {from_id or 'unknown'})\n"
+			f"Чат: {deleted.chat.id}\n"
+			f"Дата: {date}"
+		)
+		if text:
+			await context.bot.send_message(owner_id, f"{header}\n\n{text}")
+		if media_path:
+			await send_media_to_owner(context, owner_id, media_path, media_kind, header)
+		logger.info(
+			"Forwarded deleted message: connection=%s chat=%s message=%s owner=%s",
+			deleted.business_connection_id,
+			deleted.chat.id,
+			message_id,
+			owner_id,
+		)
 
 
 def main() -> None:
+	global DB
 	if not TOKEN:
 		raise RuntimeError("Укажите BOT_TOKEN в файле .env")
 
 	configure_logging()
-	logger.info("Starting bot")
+	MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+	DB = init_db()
 	application = Application.builder().token(TOKEN).build()
 	application.add_handler(TypeHandler(Update, log_update), group=-1)
 	application.add_handler(CommandHandler("start", on_start))
@@ -251,7 +340,8 @@ def main() -> None:
 		MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, on_business_message)
 	)
 	application.add_handler(CallbackQueryHandler(on_instruction, pattern="^instruction$"))
-	application.add_handler(BusinessMessagesDeletedHandler(on_business_messages_deleted))
+	application.add_handler(BusinessMessagesDeletedHandler(on_deleted_messages))
+	logger.info("Bot started")
 	application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
